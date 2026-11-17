@@ -148,6 +148,235 @@ fn test_local_evaluation_with_cohorts_payload() {
     assert_eq!(result.unwrap(), Some(FlagValue::Boolean(false)));
 }
 
+fn evaluate(
+    evaluator: &LocalEvaluator,
+    key: &str,
+    properties: &HashMap<String, serde_json::Value>,
+) -> Result<Option<FlagValue>, posthog_rs::InconclusiveMatchError> {
+    evaluator.evaluate_flag(
+        key,
+        "user-123",
+        properties,
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+}
+
+/// Regression test: the API accepts `is_set` / `is_not_set` filters without a
+/// `value`, on flags and on cohort leaves alike. Before the fix one such filter
+/// failed to deserialize and took down the entire `LocalEvaluationResponse`,
+/// so no flag in the project could be evaluated locally.
+#[test]
+fn test_local_evaluation_with_valueless_presence_operators() {
+    let presence_flag = |key: &str, operator: &str| {
+        json!({
+            "key": key,
+            "active": true,
+            "filters": {
+                "groups": [
+                    {
+                        "properties": [{"key": "plan", "type": "person", "operator": operator}],
+                        "rollout_percentage": 100.0
+                    }
+                ]
+            }
+        })
+    };
+    let payload = json!({
+        "flags": [
+            {
+                "key": "plain-flag",
+                "active": true,
+                "filters": {"groups": [{"properties": [], "rollout_percentage": 100.0}]}
+            },
+            presence_flag("plan-set", "is_set"),
+            presence_flag("plan-not-set", "is_not_set"),
+            {
+                "key": "cohort-flag",
+                "active": true,
+                "filters": {
+                    "groups": [
+                        {
+                            "properties": [{"key": "id", "value": 7, "type": "cohort"}],
+                            "rollout_percentage": 100.0
+                        }
+                    ]
+                }
+            }
+        ],
+        "group_type_mapping": {},
+        "cohorts": {
+            "7": {
+                "type": "AND",
+                "values": [{"key": "plan", "type": "person", "operator": "is_set"}]
+            }
+        }
+    });
+
+    let response: LocalEvaluationResponse =
+        serde_json::from_value(payload).expect("value-less presence filters should deserialize");
+    assert_eq!(response.flags.len(), 4);
+
+    let cache = FlagCache::new();
+    let evaluator = LocalEvaluator::new(cache.clone());
+    cache.update(response);
+
+    let with_plan = HashMap::from([("plan".to_string(), json!("pro"))]);
+    let without_plan = HashMap::new();
+
+    for (key, expected) in [
+        ("plain-flag", true),
+        ("plan-set", true),
+        ("plan-not-set", false),
+        ("cohort-flag", true),
+    ] {
+        assert_eq!(
+            evaluate(&evaluator, key, &with_plan).unwrap(),
+            Some(FlagValue::Boolean(expected)),
+            "{}",
+            key
+        );
+    }
+
+    // 0.23.2 semantics: a property missing from the caller's context is a
+    // definite "not set" (later releases report it as inconclusive).
+    for (key, expected) in [
+        ("plan-set", false),
+        ("plan-not-set", true),
+        ("cohort-flag", false),
+    ] {
+        assert_eq!(
+            evaluate(&evaluator, key, &without_plan).unwrap(),
+            Some(FlagValue::Boolean(expected)),
+            "{}",
+            key
+        );
+    }
+}
+
+fn poller_for(server: &MockServer, cache: FlagCache) -> FlagPoller {
+    let config = LocalEvaluationConfig {
+        personal_api_key: "test_personal_key".to_string(),
+        project_api_key: "test_project_key".to_string(),
+        api_host: server.base_url(),
+        poll_interval: Duration::from_secs(60),
+        request_timeout: Duration::from_secs(5),
+    };
+    FlagPoller::new(config, cache)
+}
+
+/// A definition this SDK cannot read is skipped on its own when definitions
+/// load: the other flags in the response still load, and the skipped flag is
+/// absent from the cache, like any other flag local evaluation cannot resolve.
+#[test]
+fn test_unreadable_flag_definition_does_not_drop_other_flags() {
+    let server = MockServer::start();
+    let definitions = server.mock(|when, then| {
+        when.method(GET).path("/flags/definitions/");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{
+                    "flags": [
+                        {
+                            "key": "exact-without-value",
+                            "active": true,
+                            "filters": {"groups": [{
+                                "properties": [{"key": "plan", "type": "person", "operator": "exact"}],
+                                "rollout_percentage": 100
+                            }]}
+                        },
+                        {"key": "active-is-not-a-boolean", "active": "yes"},
+                        {"key": "duplicate-key", "active": false, "active": true},
+                        {
+                            "key": "plain-flag",
+                            "active": true,
+                            "filters": {"groups": [{"properties": [], "rollout_percentage": 100}]}
+                        }
+                    ],
+                    "group_type_mapping": {},
+                    "cohorts": {}
+                }"#,
+            );
+    });
+
+    let cache = FlagCache::new();
+    poller_for(&server, cache.clone())
+        .load_flags()
+        .expect("unreadable flags should not fail the load");
+    definitions.assert();
+
+    let evaluator = LocalEvaluator::new(cache);
+    let properties = HashMap::from([("plan".to_string(), json!("pro"))]);
+    assert_eq!(
+        evaluate(&evaluator, "plain-flag", &properties).unwrap(),
+        Some(FlagValue::Boolean(true))
+    );
+    for skipped in [
+        "exact-without-value",
+        "active-is-not-a-boolean",
+        "duplicate-key",
+    ] {
+        assert_eq!(
+            evaluate(&evaluator, skipped, &properties).unwrap(),
+            None,
+            "{}",
+            skipped
+        );
+    }
+}
+
+/// Skipping is confined to flag definitions that fail on their own. A response
+/// that is unreadable for any other reason is still rejected whole, and the
+/// definitions already cached stay in place.
+#[test]
+fn test_definitions_unreadable_outside_flags_are_still_rejected() {
+    let unreadable_flag = r#"{"key":"active-is-not-a-boolean","active":"yes"}"#;
+    let bodies = [
+        // A field outside `flags` has the wrong type.
+        [
+            r#"{"flags":["#,
+            unreadable_flag,
+            r#"],"group_type_mapping":"not-a-map"}"#,
+        ]
+        .concat(),
+        // A key outside `flags` is repeated.
+        [
+            r#"{"flags":["#,
+            unreadable_flag,
+            r#"],"cohorts":{},"cohorts":{}}"#,
+        ]
+        .concat(),
+    ];
+
+    for body in bodies {
+        let server = MockServer::start();
+        let definitions = server.mock(|when, then| {
+            when.method(GET).path("/flags/definitions/");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(&body);
+        });
+
+        let cache = FlagCache::new();
+        cache.update(
+            serde_json::from_value(json!({
+                "flags": [{"key": "cached-flag", "active": true}]
+            }))
+            .unwrap(),
+        );
+
+        let result = poller_for(&server, cache.clone()).load_flags();
+        definitions.assert();
+        assert!(
+            matches!(result, Err(posthog_rs::Error::Serialization(_))),
+            "{}",
+            body
+        );
+        assert!(cache.get_flag("cached-flag").is_some(), "{}", body);
+    }
+}
+
 /// A cyclic cohort definition must leave local evaluation inconclusive so the
 /// flag falls back to `/flags`. Before the cycle guard this recursed until the
 /// stack was exhausted, which aborts the process rather than panicking, taking
